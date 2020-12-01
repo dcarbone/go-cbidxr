@@ -387,12 +387,12 @@ func DefaultIndexDropFunc(cluster *gocb.Cluster, def IndexDefinition) error {
 
 // ActionListFinalizerFunc is called after all decisions have been made to allow the user to make any final edits
 // before execution
-type ActionListFinalizerFunc func(actions []*IndexActionDecision, defMap *IndexDefinitionMap) []*IndexActionDecision
+type ActionListFinalizerFunc func(actions []*IndexActionDecision, defMap *IndexDefinitionMap) ([]*IndexActionDecision, error)
 
 // DefaultActionListFinalizerFunc is a basic implementation of an ActionListFinalizerFunc that merely accepts whatever
 // the initial decisions were
-func DefaultActionListFinalizerFunc(actions []*IndexActionDecision, _ *IndexDefinitionMap) []*IndexActionDecision {
-	return actions
+func DefaultActionListFinalizerFunc(actions []*IndexActionDecision, _ *IndexDefinitionMap) ([]*IndexActionDecision, error) {
+	return actions, nil
 }
 
 type ReconcilerConfig struct {
@@ -495,7 +495,7 @@ func (rc *Reconciler) RegisterDefinitions(defs ...IndexDefinition) error {
 	return rc.idxMap.Register(defs...)
 }
 
-func (rc *Reconciler) Execute() *ReconcileResults {
+func (rc *Reconciler) Execute() (*ReconcileResults, error) {
 	recResults := newReconcileResults()
 	actDecisions := make([]*IndexActionDecision, 0)
 	// todo: this is a very lazy way to do this.
@@ -505,7 +505,7 @@ func (rc *Reconciler) Execute() *ReconcileResults {
 	currentIndices, err := rc.locFn(rc.cluster)
 	if err != nil {
 		recResults.Err = err
-		return recResults
+		return recResults, recResults.Err
 	}
 
 	// update results
@@ -519,7 +519,7 @@ func (rc *Reconciler) Execute() *ReconcileResults {
 		found[curr.Name] = struct{}{}
 		if decision, err := rc.decFn(curr, rc.idxMap); err != nil {
 			recResults.Err = fmt.Errorf("error executing %T on index %q: %v", rc.decFn, curr.Name, err)
-			return recResults
+			return recResults, recResults.Err
 		} else {
 			actDecisions = append(actDecisions, decision)
 		}
@@ -538,7 +538,11 @@ func (rc *Reconciler) Execute() *ReconcileResults {
 	}
 
 	// finalize the action list
-	finalActionList := rc.finalizerFn(actDecisions, rc.idxMap)
+	finalActionList, err := rc.finalizerFn(actDecisions, rc.idxMap)
+	if err != nil {
+		recResults.Err = fmt.Errorf("error finalizing action list: %w", err)
+		return recResults, recResults.Err
+	}
 
 	for _, act := range finalActionList {
 		switch act.Action {
@@ -550,7 +554,7 @@ func (rc *Reconciler) Execute() *ReconcileResults {
 		case IndexActionCreate:
 			if _, err := rc.idxCreateFn(rc.cluster, *act.NewDefinition); err != nil {
 				recResults.Err = fmt.Errorf("error executing index create func %T on index %q: %w", rc.idxCreateFn, act.Name, err)
-				return recResults
+				return recResults, recResults.Err
 			}
 			recResults.CreatedCount++
 			recResults.CreatedNames = append(recResults.CreatedNames, act.Name)
@@ -559,20 +563,20 @@ func (rc *Reconciler) Execute() *ReconcileResults {
 		case IndexActionDrop:
 			if err := rc.idxDropFn(rc.cluster, *act.CurrentDefinition); err != nil {
 				recResults.Err = fmt.Errorf("error executing index drop func %T on index %q: %w", rc.idxDropFn, act.Name, err)
-				return recResults
+				return recResults, recResults.Err
 			}
 			recResults.DroppedCount++
 			recResults.DroppedNames = append(recResults.DroppedNames, act.Name)
 		case IndexActionRecreate:
 			if err := rc.idxDropFn(rc.cluster, *act.CurrentDefinition); err != nil {
 				recResults.Err = fmt.Errorf("error executing index drop func %T on index %q: %w", rc.idxDropFn, act.Name, err)
-				return recResults
+				return recResults, recResults.Err
 			}
 			recResults.DroppedCount++
 			recResults.DroppedNames = append(recResults.DroppedNames, act.Name)
 			if _, err := rc.idxCreateFn(rc.cluster, *act.NewDefinition); err != nil {
 				recResults.Err = fmt.Errorf("error executing index create func %T on index %q: %w", rc.idxCreateFn, act.Name, err)
-				return recResults
+				return recResults, recResults.Err
 			}
 			recResults.CreatedCount++
 			recResults.CreatedNames = append(recResults.CreatedNames, act.Name)
@@ -586,5 +590,5 @@ func (rc *Reconciler) Execute() *ReconcileResults {
 
 	recResults.ActionList = finalActionList
 
-	return recResults
+	return recResults, nil
 }

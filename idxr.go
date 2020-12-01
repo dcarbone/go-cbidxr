@@ -16,44 +16,29 @@ const (
 	DefaultCreateQueryFormat = "CREATE INDEX `%s` ON `%s`(%s) WHERE (%s) USING %s WITH {\"num_replica\": %d, \"defer_build\": %t}"
 )
 
-type IndexAction uint8
+type IndexAction string
 
 const (
-	IndexActionNoop IndexAction = iota
-	IndexActionDelete
-	IndexActionRecreate
-	IndexActionCreate
+	IndexActionNoop     IndexAction = "noop"
+	IndexActionDrop     IndexAction = "drop"
+	IndexActionRecreate IndexAction = "recreate"
+	IndexActionCreate   IndexAction = "create"
 )
-
-func (a IndexAction) String() string {
-	switch a {
-	case IndexActionNoop:
-		return "noop"
-	case IndexActionDelete:
-		return "delete"
-	case IndexActionRecreate:
-		return "recreate"
-	case IndexActionCreate:
-		return "create"
-	default:
-		return "unknown"
-	}
-}
 
 // IndexActionDecision describes the outcome of the DecisionFunc
 type IndexActionDecision struct {
 	// Name is the name of the index being acted upon
-	Name string
+	Name string `json:"name"`
 
 	// Action describes what will happen to this index
-	Action IndexAction
+	Action IndexAction `json:"action"`
 
 	// CurrentDefinition will be populated if an index with this name already exists within Couchbase
-	CurrentDefinition *IndexDefinition
+	CurrentDefinition *IndexDefinition `json:"current_definition"`
 
 	// NewDefinition will be populated if an index with this name is present in the new DefinitionMap provided to the
 	// parent Reconciler
-	NewDefinition *IndexDefinition
+	NewDefinition *IndexDefinition `json:"new_definition"`
 }
 
 type IndexDefinition struct {
@@ -78,6 +63,11 @@ func (def *IndexDefinition) clone() IndexDefinition {
 	return *tmp
 }
 
+func (def *IndexDefinition) clonePtr() *IndexDefinition {
+	cloned := def.clone()
+	return &cloned
+}
+
 type IndexDefinitionMap struct {
 	mu          sync.RWMutex
 	defs        map[string]IndexDefinition
@@ -86,16 +76,13 @@ type IndexDefinitionMap struct {
 
 func NewIndexDefinitionMap(defs ...IndexDefinition) (*IndexDefinitionMap, error) {
 	dm := new(IndexDefinitionMap)
-	for i, def := range defs {
-		if err := dm.Register(def); err != nil {
-			return nil, fmt.Errorf("init-time index definition %d has error: %w", i, err)
-		}
+	if err := dm.Register(defs...); err != nil {
+		return nil, err
 	}
 	return dm, nil
 }
 
-// Register validates the provided definition and then adds to the map
-func (dm *IndexDefinitionMap) Register(def IndexDefinition) error {
+func (dm *IndexDefinitionMap) doRegister(def IndexDefinition) error {
 	// build actual entry
 	actual := new(IndexDefinition)
 	actual.Name = strings.TrimSpace(def.Name)
@@ -106,6 +93,7 @@ func (dm *IndexDefinitionMap) Register(def IndexDefinition) error {
 	actual.Using = strings.TrimSpace(def.Using)
 	actual.NumReplica = def.NumReplica
 	actual.DeferBuild = def.DeferBuild
+	actual.ForceRebuild = def.ForceRebuild
 
 	// validate entry
 	if actual.Name == "" {
@@ -151,6 +139,16 @@ func (dm *IndexDefinitionMap) Register(def IndexDefinition) error {
 		dm.hasDeferred = true
 	}
 
+	return nil
+}
+
+// Register validates and then adds the provided definition(s) the map
+func (dm *IndexDefinitionMap) Register(defs ...IndexDefinition) error {
+	for _, def := range defs {
+		if err := dm.doRegister(def); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -224,14 +222,18 @@ type ReconcileResults struct {
 	CreatedCount int      `json:"created_count"`
 	CreatedNames []string `json:"created_names"`
 
-	DeletedCount int      `json:"deleted_count"`
-	DeletedNames []string `json:"deleted_names"`
+	DroppedCount int      `json:"dropped_count"`
+	DroppedNames []string `json:"dropped_names"`
 
 	NoopCount int      `json:"noop_count"`
 	NoopNames []string `json:"noop_names"`
 
 	FinalCount int      `json:"final_count"`
 	FinalNames []string `json:"final_names"`
+
+	ActionList []*IndexActionDecision `json:"action_list"`
+
+	Err error `json:"err"`
 }
 
 func (r ReconcileResults) String() string {
@@ -239,52 +241,94 @@ func (r ReconcileResults) String() string {
 		"Reconcile results: initial_count=%d; created_count=%d; deleted_count=%d; noop_count=%d; final_count=%d",
 		r.InitialCount,
 		r.CreatedCount,
-		r.DeletedCount,
+		r.DroppedCount,
 		r.NoopCount,
 		r.FinalCount,
 	)
 }
 
+func (r ReconcileResults) Error() string {
+	if r.Err == nil {
+		return ""
+	}
+	return r.Err.Error()
+}
+
+func newReconcileResults() *ReconcileResults {
+	rr := new(ReconcileResults)
+	rr.InitialNames = make([]string, 0)
+	rr.CreatedNames = make([]string, 0)
+	rr.DroppedNames = make([]string, 0)
+	rr.NoopNames = make([]string, 0)
+	rr.FinalNames = make([]string, 0)
+	rr.ActionList = make([]*IndexActionDecision, 0)
+	return rr
+}
+
 // IndexLocatorFunc is used to retrieve the list of indices of interest from Couchbase
-type IndexLocatorFunc func(*gocb.Cluster) (*gocb.QueryResult, error)
+type IndexLocatorFunc func(*gocb.Cluster) ([]*IndexDefinition, error)
 
 // PrefixIndexLocatorFunc constructs a IndexLocatorFunc that queries for a list of indices based on a common prefix
 func PrefixIndexLocatorFunc(idxPrefix string, opts *gocb.QueryOptions) IndexLocatorFunc {
-	return func(cluster *gocb.Cluster) (*gocb.QueryResult, error) {
+	return func(cluster *gocb.Cluster) ([]*IndexDefinition, error) {
 		if opts == nil {
 			opts = new(gocb.QueryOptions)
 			opts.Adhoc = true
 			opts.ScanConsistency = gocb.QueryScanConsistencyRequestPlus
 			opts.Readonly = true
 		}
-		return cluster.Query(fmt.Sprintf(DefaultListQueryFormat, idxPrefix), opts)
+		res, err := cluster.Query(fmt.Sprintf(DefaultListQueryFormat, idxPrefix), opts)
+		if err != nil {
+			return nil, err
+		}
+		current := make([]*IndexDefinition, 0)
+		for res.Next() {
+			idxDef := new(IndexDefinition)
+			if err := res.Row(idxDef); err != nil {
+				return nil, fmt.Errorf("error fetching row from index locator query: %v", err)
+			}
+			current = append(current, idxDef)
+		}
+		return current, nil
 	}
 }
 
 // DecisionFunc is called per index currently present in Couchbase to determine what will happen to it.
-type DecisionFunc func(current *IndexDefinition, defMap *IndexDefinitionMap) (IndexAction, error)
+type DecisionFunc func(current *IndexDefinition, defMap *IndexDefinitionMap) (*IndexActionDecision, error)
 
 // DefaultDecisionFunc attempts to determine if a current index's definition is sane, returning an action appropriate
 // to its current state
-func DefaultDecisionFunc(current *IndexDefinition, defMap *IndexDefinitionMap) (IndexAction, error) {
+func DefaultDecisionFunc(current *IndexDefinition, defMap *IndexDefinitionMap) (*IndexActionDecision, error) {
 	var (
-		def IndexDefinition
-		ok  bool
+		newDef IndexDefinition
+		ok     bool
+
+		decision = new(IndexActionDecision)
 	)
+
+	decision.Name = current.Name
+	decision.CurrentDefinition = current
+
 	// if current index is not present in map, delete
-	if def, ok = defMap.Get(current.Name); !ok {
-		return IndexActionDelete, nil
+	if newDef, ok = defMap.Get(current.Name); !ok {
+		decision.Action = IndexActionDrop
+		return decision, nil
 	}
+
+	// set updated def to decision
+	decision.NewDefinition = newDef.clonePtr()
+
 	// if found but it is being forcibly rebuilt or it has major differences, recreate
-	if def.ForceRebuild || def.KeyspaceID != current.KeyspaceID || def.Condition != current.Condition {
-		return IndexActionRecreate, nil
+	if newDef.ForceRebuild || newDef.KeyspaceID != current.KeyspaceID || newDef.Condition != current.Condition {
+		decision.Action = IndexActionRecreate
+		return decision, nil
 	}
 
 	// if we get here, more detailed analysis is required...
 
 	// first test to ensure that all expected fields are at least present
 KeyOuter:
-	for _, key := range def.IndexKeys {
+	for _, key := range newDef.IndexKeys {
 		key = strings.Trim(key, "`")
 		for _, currentKey := range current.IndexKeys {
 			currentKey = strings.Trim(currentKey, "`")
@@ -292,24 +336,27 @@ KeyOuter:
 				continue KeyOuter
 			}
 		}
-		return IndexActionRecreate, nil
+		decision.Action = IndexActionRecreate
+		return decision, nil
 	}
 
 	// if expected fields are present, ensure we don't have extra fields
-	if len(def.IndexKeys) != len(current.IndexKeys) {
-		return IndexActionRecreate, nil
+	if len(newDef.IndexKeys) != len(current.IndexKeys) {
+		decision.Action = IndexActionRecreate
+		return decision, nil
 	}
 
 	// otherwise, probably ok.
-	return IndexActionNoop, nil
+	decision.Action = IndexActionNoop
+	return decision, nil
 }
 
 // IndexCreateFunc is called whenever an index is missing from Couchbase
-type IndexCreateFunc func(cluster *gocb.Cluster, def IndexDefinition, queryOpts *gocb.QueryOptions) (*gocb.QueryResult, error)
+type IndexCreateFunc func(cluster *gocb.Cluster, def IndexDefinition) (*gocb.QueryResult, error)
 
 // DefaultIndexCreateFunc is a basic implementation of an IndexCreateFunc that accounts for configurable replicas and
 // build deferring
-func DefaultIndexCreateFunc(cluster *gocb.Cluster, def IndexDefinition, queryOpts *gocb.QueryOptions) (*gocb.QueryResult, error) {
+func DefaultIndexCreateFunc(cluster *gocb.Cluster, def IndexDefinition) (*gocb.QueryResult, error) {
 	// still have to use direct n1ql here as the modeled approach does not allow for num_replica specification
 	createQuery := fmt.Sprintf(
 		DefaultCreateQueryFormat,
@@ -321,21 +368,21 @@ func DefaultIndexCreateFunc(cluster *gocb.Cluster, def IndexDefinition, queryOpt
 		def.NumReplica,
 		def.DeferBuild,
 	)
-	if queryOpts == nil {
-		queryOpts := new(gocb.QueryOptions)
-		queryOpts.ScanConsistency = gocb.QueryScanConsistencyRequestPlus
-	}
+	queryOpts := new(gocb.QueryOptions)
+	queryOpts.ScanConsistency = gocb.QueryScanConsistencyRequestPlus
 	return cluster.Query(createQuery, queryOpts)
 }
 
 // IndexDropFunc is called whenever an index is present in Couchbase that is no longer present in the map provided
 // to a Reconciler instance
-type IndexDropFunc func(cluster *gocb.Cluster, def IndexDefinition, opts *gocb.DropQueryIndexOptions) error
+type IndexDropFunc func(cluster *gocb.Cluster, def IndexDefinition) error
 
 // DefaultIndexDropFunc is a very basic implementation of an IndexDropFunc that merely calls the upstream gocb/v2
 // built-in DropIndex func
-func DefaultIndexDropFunc(cluster *gocb.Cluster, def IndexDefinition, opts *gocb.DropQueryIndexOptions) error {
-	return cluster.QueryIndexes().DropIndex(def.KeyspaceID, def.Name, opts)
+func DefaultIndexDropFunc(cluster *gocb.Cluster, def IndexDefinition) error {
+	opts := new(gocb.DropQueryIndexOptions)
+	opts.IgnoreIfNotExists = true
+	return cluster.QueryIndexes().DropIndex(def.KeyspaceID, def.Name, nil)
 }
 
 // ActionListFinalizerFunc is called after all decisions have been made to allow the user to make any final edits
@@ -351,6 +398,10 @@ func DefaultActionListFinalizerFunc(actions []*IndexActionDecision, _ *IndexDefi
 type ReconcilerConfig struct {
 	// Cluster [required] - Up and valid couchbase cluster connection
 	Cluster *gocb.Cluster
+
+	// IndexDefinitionMap [optional] - Optional index map to provide at time of construction.  If left empty, a new
+	// instance will be created as part of creating a new Reconciler
+	IndexDefinitionMap *IndexDefinitionMap
 
 	// IndexLocatorFunc [required] - Func used to retrieve list of current indices of interest within Couchbase
 	IndexLocatorFunc IndexLocatorFunc
@@ -381,15 +432,159 @@ func DefaultReconcilerConfig(cluster *gocb.Cluster, idxLocator IndexLocatorFunc)
 	return conf
 }
 
+// Reconciler is a Couchbase bucket index management utility that enables developers to control their state in code.
+//
+// No concurrency protection is done, control yourself.
 type Reconciler struct {
-	mu      sync.Mutex
-	idxMap  *IndexDefinitionMap
 	cluster *gocb.Cluster
-	locFn   IndexLocatorFunc
+
+	idxMap *IndexDefinitionMap
+
+	locFn       IndexLocatorFunc
+	decFn       DecisionFunc
+	idxCreateFn IndexCreateFunc
+	idxDropFn   IndexDropFunc
+	finalizerFn ActionListFinalizerFunc
 
 	res *ReconcileResults
 }
 
-func NewReconciler(cluster *gocb.Cluster) {
+// NewReconciler creates a new Reconciler instance based on the provided config
+func NewReconciler(conf *ReconcilerConfig) (*Reconciler, error) {
+	rc := new(Reconciler)
 
+	rc.cluster = conf.Cluster
+	rc.locFn = conf.IndexLocatorFunc
+
+	if conf.IndexDefinitionMap == nil {
+		rc.idxMap, _ = NewIndexDefinitionMap()
+	} else {
+		rc.idxMap = conf.IndexDefinitionMap
+	}
+
+	def := DefaultReconcilerConfig(conf.Cluster, conf.IndexLocatorFunc)
+	if conf.DecisionFunc != nil {
+		rc.decFn = conf.DecisionFunc
+	} else {
+		rc.decFn = def.DecisionFunc
+	}
+	if conf.IndexCreateFunc != nil {
+		rc.idxCreateFn = conf.IndexCreateFunc
+	} else {
+		rc.idxCreateFn = def.IndexCreateFunc
+	}
+	if conf.IndexDropFunc != nil {
+		rc.idxDropFn = conf.IndexDropFunc
+	} else {
+		rc.idxDropFn = def.IndexDropFunc
+	}
+	if conf.ActionListFinalizerFunc != nil {
+		rc.finalizerFn = conf.ActionListFinalizerFunc
+	} else {
+		rc.finalizerFn = def.ActionListFinalizerFunc
+	}
+
+	return rc, nil
+}
+
+func (rc *Reconciler) Definitions() *IndexDefinitionMap {
+	return rc.idxMap
+}
+
+func (rc *Reconciler) RegisterDefinitions(defs ...IndexDefinition) error {
+	return rc.idxMap.Register(defs...)
+}
+
+func (rc *Reconciler) Execute() *ReconcileResults {
+	recResults := newReconcileResults()
+	actDecisions := make([]*IndexActionDecision, 0)
+	// todo: this is a very lazy way to do this.
+	found := make(map[string]struct{})
+
+	// get current index list
+	currentIndices, err := rc.locFn(rc.cluster)
+	if err != nil {
+		recResults.Err = err
+		return recResults
+	}
+
+	// update results
+	recResults.InitialCount = len(currentIndices)
+	for _, curr := range currentIndices {
+		recResults.InitialNames = append(recResults.InitialNames, curr.Name)
+	}
+
+	// determine what to do with current definitions
+	for _, curr := range currentIndices {
+		found[curr.Name] = struct{}{}
+		if decision, err := rc.decFn(curr, rc.idxMap); err != nil {
+			recResults.Err = fmt.Errorf("error executing %T on index %q: %v", rc.decFn, curr.Name, err)
+			return recResults
+		} else {
+			actDecisions = append(actDecisions, decision)
+		}
+	}
+
+	// add any missing entries from current definition list
+	for name, upd := range rc.idxMap.Map() {
+		if _, ok := found[name]; ok {
+			continue
+		}
+		actDecisions = append(actDecisions, &IndexActionDecision{
+			Name:          upd.Name,
+			Action:        IndexActionCreate,
+			NewDefinition: upd.clonePtr(),
+		})
+	}
+
+	// finalize the action list
+	finalActionList := rc.finalizerFn(actDecisions, rc.idxMap)
+
+	for _, act := range finalActionList {
+		switch act.Action {
+		case IndexActionNoop:
+			recResults.NoopCount++
+			recResults.NoopNames = append(recResults.NoopNames, act.Name)
+			recResults.FinalCount++
+			recResults.FinalNames = append(recResults.FinalNames, act.Name)
+		case IndexActionCreate:
+			if _, err := rc.idxCreateFn(rc.cluster, *act.NewDefinition); err != nil {
+				recResults.Err = fmt.Errorf("error executing index create func %T on index %q: %w", rc.idxCreateFn, act.Name, err)
+				return recResults
+			}
+			recResults.CreatedCount++
+			recResults.CreatedNames = append(recResults.CreatedNames, act.Name)
+			recResults.FinalCount++
+			recResults.FinalNames = append(recResults.FinalNames, act.Name)
+		case IndexActionDrop:
+			if err := rc.idxDropFn(rc.cluster, *act.CurrentDefinition); err != nil {
+				recResults.Err = fmt.Errorf("error executing index drop func %T on index %q: %w", rc.idxDropFn, act.Name, err)
+				return recResults
+			}
+			recResults.DroppedCount++
+			recResults.DroppedNames = append(recResults.DroppedNames, act.Name)
+		case IndexActionRecreate:
+			if err := rc.idxDropFn(rc.cluster, *act.CurrentDefinition); err != nil {
+				recResults.Err = fmt.Errorf("error executing index drop func %T on index %q: %w", rc.idxDropFn, act.Name, err)
+				return recResults
+			}
+			recResults.DroppedCount++
+			recResults.DroppedNames = append(recResults.DroppedNames, act.Name)
+			if _, err := rc.idxCreateFn(rc.cluster, *act.NewDefinition); err != nil {
+				recResults.Err = fmt.Errorf("error executing index create func %T on index %q: %w", rc.idxCreateFn, act.Name, err)
+				return recResults
+			}
+			recResults.CreatedCount++
+			recResults.CreatedNames = append(recResults.CreatedNames, act.Name)
+			recResults.FinalCount++
+			recResults.FinalNames = append(recResults.FinalNames, act.Name)
+
+		default:
+			panic(fmt.Sprintf("Unknown action %q seen", act.Action))
+		}
+	}
+
+	recResults.ActionList = finalActionList
+
+	return recResults
 }

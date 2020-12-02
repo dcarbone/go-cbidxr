@@ -318,7 +318,7 @@ func DefaultDecisionFunc(current *IndexDefinition, defMap *IndexDefinitionMap) (
 		decision.ActionReason = fmt.Sprintf(IndexActionReasonRecreateKeyspaceIDMismatch, current.KeyspaceID, newDef.KeyspaceID)
 		return decision, nil
 	}
-	if newDef.Condition != strings.Trim(current.Condition, "()") {
+	if newDef.Condition != current.Condition {
 		decision.Action = IndexActionRecreate
 		decision.ActionReason = fmt.Sprintf(IndexActionReasonRecreateConditionMismatch, current.Condition, newDef.Condition)
 		return decision, nil

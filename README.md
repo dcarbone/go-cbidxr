@@ -4,7 +4,7 @@ Couchbase index reconciliation tools for golang
 [![](https://img.shields.io/badge/godoc-reference-5272B4.svg?style=flat-square)](https://godoc.org/github.com/dcarbone/go-cbidxr)
 
 ## Concept
-This is, in effect, a state comparison library.  You are expected to construct the desire state of indices, which are 
+This is, in effect, a state comparison library.  You are expected to construct the desired state of indices, which are 
 then compared against what is actually present in the connected Couchbase cluster, and differences are reconciled.
 
 Basic order of operations:

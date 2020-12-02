@@ -253,56 +253,6 @@ func (dm *IndexDefinitionMap) Clear() {
 	dm.defs = nil
 }
 
-type ReconcileResults struct {
-	InitialCount int      `json:"initial_count"`
-	InitialNames []string `json:"initial_names"`
-
-	CreatedCount int      `json:"created_count"`
-	CreatedNames []string `json:"created_names"`
-
-	DroppedCount int      `json:"dropped_count"`
-	DroppedNames []string `json:"dropped_names"`
-
-	NoopCount int      `json:"noop_count"`
-	NoopNames []string `json:"noop_names"`
-
-	FinalCount int      `json:"final_count"`
-	FinalNames []string `json:"final_names"`
-
-	ActionList []*IndexActionDecision `json:"action_list"`
-
-	Err error `json:"err"`
-}
-
-func (r ReconcileResults) String() string {
-	return fmt.Sprintf(
-		"Reconcile results: initial_count=%d; created_count=%d; deleted_count=%d; noop_count=%d; final_count=%d",
-		r.InitialCount,
-		r.CreatedCount,
-		r.DroppedCount,
-		r.NoopCount,
-		r.FinalCount,
-	)
-}
-
-func (r ReconcileResults) Error() string {
-	if r.Err == nil {
-		return ""
-	}
-	return r.Err.Error()
-}
-
-func newReconcileResults() *ReconcileResults {
-	rr := new(ReconcileResults)
-	rr.InitialNames = make([]string, 0)
-	rr.CreatedNames = make([]string, 0)
-	rr.DroppedNames = make([]string, 0)
-	rr.NoopNames = make([]string, 0)
-	rr.FinalNames = make([]string, 0)
-	rr.ActionList = make([]*IndexActionDecision, 0)
-	return rr
-}
-
 // IndexLocatorFunc is used to retrieve the list of indices of interest from Couchbase
 type IndexLocatorFunc func(*gocb.Cluster) ([]*IndexDefinition, error)
 
@@ -446,6 +396,56 @@ type ActionListFinalizerFunc func(actions []*IndexActionDecision, defMap *IndexD
 // the initial decisions were
 func DefaultActionListFinalizerFunc(actions []*IndexActionDecision, _ *IndexDefinitionMap) ([]*IndexActionDecision, error) {
 	return actions, nil
+}
+
+type ReconcileResults struct {
+	InitialCount int      `json:"initial_count"`
+	InitialNames []string `json:"initial_names"`
+
+	CreatedCount int      `json:"created_count"`
+	CreatedNames []string `json:"created_names"`
+
+	DroppedCount int      `json:"dropped_count"`
+	DroppedNames []string `json:"dropped_names"`
+
+	NoopCount int      `json:"noop_count"`
+	NoopNames []string `json:"noop_names"`
+
+	FinalCount int      `json:"final_count"`
+	FinalNames []string `json:"final_names"`
+
+	ActionList []*IndexActionDecision `json:"action_list"`
+
+	Err error `json:"err"`
+}
+
+func (r ReconcileResults) String() string {
+	return fmt.Sprintf(
+		"Reconcile results: initial_count=%d; created_count=%d; deleted_count=%d; noop_count=%d; final_count=%d",
+		r.InitialCount,
+		r.CreatedCount,
+		r.DroppedCount,
+		r.NoopCount,
+		r.FinalCount,
+	)
+}
+
+func (r ReconcileResults) Error() string {
+	if r.Err == nil {
+		return ""
+	}
+	return r.Err.Error()
+}
+
+func newReconcileResults() *ReconcileResults {
+	rr := new(ReconcileResults)
+	rr.InitialNames = make([]string, 0)
+	rr.CreatedNames = make([]string, 0)
+	rr.DroppedNames = make([]string, 0)
+	rr.NoopNames = make([]string, 0)
+	rr.FinalNames = make([]string, 0)
+	rr.ActionList = make([]*IndexActionDecision, 0)
+	return rr
 }
 
 type ReconcilerConfig struct {

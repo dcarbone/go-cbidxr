@@ -1,6 +1,7 @@
 package cbidxr_test
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -148,7 +149,8 @@ func TestReconciler(t *testing.T) {
 				t.FailNow()
 				return
 			}
-			t.Logf("results=%v", res)
+			b, _ := json.Marshal(res)
+			t.Logf("results=%s", string(b))
 			rc = buildReconciler(t, cluster, atest)
 			if err := rc.RegisterDefinitions(atest.FinalState...); err != nil {
 				t.Logf("error registering final state definitions; %v", err)
@@ -161,7 +163,8 @@ func TestReconciler(t *testing.T) {
 				t.FailNow()
 				return
 			}
-			t.Logf("results=%v", res)
+			b, _ = json.Marshal(res)
+			t.Logf("results=%s", string(b))
 		})
 	}
 }

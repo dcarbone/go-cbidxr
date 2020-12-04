@@ -41,6 +41,41 @@ type testConfig struct {
 	Tests     []*testTestConfig    `json:"tests"`
 }
 
+var idxDefs = map[string]*cbidxr.IndexDefinition{
+	"idx1": {
+		Name: defaultIDXPrefix + "idx1",
+
+		IndexKey:     []string{"`field1`", "`field2`"},
+		Condition:    "(`_type` = \"sandwiches\")",
+		Using:        cbidxr.IndexDefaultUsing,
+		NumReplica:   0,
+		DeferBuild:   true,
+		ForceRebuild: false,
+	},
+	"idx2": {
+		Name:         defaultIDXPrefix + "idx2",
+		IndexKey:     []string{"`field3`", "`field4`"},
+		Condition:    "(`_type` != \"sandwiches\")",
+		Using:        cbidxr.IndexDefaultUsing,
+		NumReplica:   0,
+		DeferBuild:   true,
+		ForceRebuild: false,
+	},
+}
+
+func getIDXDef(t *testing.T, idxName, bucketName string) *cbidxr.IndexDefinition {
+	def, ok := idxDefs[idxName]
+	if !ok {
+		t.Fatalf("No index named %q found", idxName)
+	}
+	tmp := new(cbidxr.IndexDefinition)
+	*tmp = *def
+	tmp.IndexKey = make([]string, len(def.IndexKey))
+	copy(tmp.IndexKey, def.IndexKey)
+	tmp.KeyspaceID = bucketName
+	return tmp
+}
+
 func buildCouchbaseTestConfig() *testCouchbaseConfig {
 	tc := testCouchbaseConfig{
 		Address:  os.Getenv(envCouchbaseAddress),
@@ -57,39 +92,19 @@ func buildCouchbaseTestConfig() *testCouchbaseConfig {
 	return &tc
 }
 
-var theTests *testConfig
-
-func init() {
+func buildTests(t *testing.T) *testConfig {
 	cbConf := buildCouchbaseTestConfig()
-	theTests = &testConfig{
+	return &testConfig{
 		Couchbase: cbConf,
 		Tests: []*testTestConfig{
 			{
 				Name:        "does-it-work",
 				IndexPrefix: defaultIDXPrefix,
 				InitialState: []*cbidxr.IndexDefinition{
-					{
-						Name:         defaultIDXPrefix + "idx1",
-						KeyspaceID:   cbConf.Bucket,
-						IndexKey:     []string{"`field1`", "`field2`"},
-						Condition:    "(`_type` = \"sandwiches\")",
-						Using:        cbidxr.IndexDefaultUsing,
-						NumReplica:   0,
-						DeferBuild:   true,
-						ForceRebuild: false,
-					},
+					getIDXDef(t, "idx1", cbConf.Bucket),
 				},
 				FinalState: []*cbidxr.IndexDefinition{
-					{
-						Name:         defaultIDXPrefix + "idx2",
-						KeyspaceID:   cbConf.Bucket,
-						IndexKey:     []string{"`field3`", "`field4`"},
-						Condition:    "(`_type` != \"sandwiches\")",
-						Using:        cbidxr.IndexDefaultUsing,
-						NumReplica:   0,
-						DeferBuild:   true,
-						ForceRebuild: false,
-					},
+					getIDXDef(t, "idx2", cbConf.Bucket),
 				},
 			},
 		},
@@ -130,9 +145,10 @@ func buildReconciler(t *testing.T, cluster *gocb.Cluster, atest *testTestConfig)
 }
 
 func TestReconciler(t *testing.T) {
-	for _, atest := range theTests.Tests {
+	testConfig := buildTests(t)
+	for _, atest := range testConfig.Tests {
 		t.Run(atest.Name, func(t *testing.T) {
-			cluster := buildCluster(t, theTests.Couchbase)
+			cluster := buildCluster(t, testConfig.Couchbase)
 			if cluster == nil {
 				return
 			}
